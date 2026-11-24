@@ -363,6 +363,64 @@ class TestQuantizePT2E(PT2EQuantizationTestCase):
             )
         )
 
+    def test_conv_bn_fusion_with_shared_conv_output_is_skipped(self):
+        class ConvWithTwoBatchNorms(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+                self.bn_a = torch.nn.BatchNorm2d(8)
+                self.bn_b = torch.nn.BatchNorm2d(8)
+
+            def forward(self, x):
+                y = self.conv(x)
+                return self.bn_a(y) + self.bn_b(y)
+
+        class ConvWithBatchNormAndRawOutput(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+                self.bn = torch.nn.BatchNorm2d(8)
+
+            def forward(self, x):
+                y = self.conv(x)
+                return self.bn(y), y
+
+        batch_norm_targets = {
+            torch.ops.aten._native_batch_norm_legit_no_training.default,
+            torch.ops.aten.batch_norm.default,
+        }
+        for model_cls, num_bn in (
+            (ConvWithTwoBatchNorms, 2),
+            (ConvWithBatchNormAndRawOutput, 1),
+        ):
+            with self.subTest(model=model_cls.__name__):
+                torch.manual_seed(0)
+                m = model_cls()
+                for bn in m.modules():
+                    if isinstance(bn, torch.nn.BatchNorm2d):
+                        bn.running_mean.uniform_(-1, 1)
+                        bn.running_var.uniform_(0.5, 2)
+                        bn.weight.data.uniform_(0.5, 2)
+                        bn.bias.data.uniform_(-1, 1)
+                m.eval()
+                example_inputs = (torch.randn(2, 3, 16, 16),)
+                ref_outputs = m(*example_inputs)
+                traced_model = torch.export.export(
+                    m, example_inputs, strict=True
+                ).module()
+                prepared_model = prepare_pt2e(traced_model, XNNPACKQuantizer())
+                prepared_outputs = prepared_model(*example_inputs)
+
+                torch.testing.assert_close(ref_outputs, prepared_outputs)
+                self.assertEqual(
+                    sum(
+                        node.target in batch_norm_targets
+                        for node in prepared_model.graph.nodes
+                    ),
+                    num_bn,
+                    str(prepared_model.graph),
+                )
+
     def test_linear_bn_fusion(self):
         N = 8
         for M in [16, 32]:
@@ -392,6 +450,64 @@ class TestQuantizePT2E(PT2EQuantizationTestCase):
                         node.target,
                         torch.ops.aten.batch_norm.default,
                     )
+
+    def test_linear_bn_fusion_with_shared_linear_output_is_skipped(self):
+        class LinearWithTwoBatchNorms(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 16)
+                self.bn_a = torch.nn.BatchNorm1d(16)
+                self.bn_b = torch.nn.BatchNorm1d(16)
+
+            def forward(self, x):
+                y = self.linear(x)
+                return self.bn_a(y) + self.bn_b(y)
+
+        class LinearWithBatchNormAndRawOutput(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(8, 16)
+                self.bn = torch.nn.BatchNorm1d(16)
+
+            def forward(self, x):
+                y = self.linear(x)
+                return self.bn(y), y
+
+        batch_norm_targets = {
+            torch.ops.aten._native_batch_norm_legit_no_training.default,
+            torch.ops.aten.batch_norm.default,
+        }
+        for model_cls, num_bn in (
+            (LinearWithTwoBatchNorms, 2),
+            (LinearWithBatchNormAndRawOutput, 1),
+        ):
+            with self.subTest(model=model_cls.__name__):
+                torch.manual_seed(0)
+                m = model_cls()
+                for bn in m.modules():
+                    if isinstance(bn, torch.nn.BatchNorm1d):
+                        bn.running_mean.uniform_(-1, 1)
+                        bn.running_var.uniform_(0.5, 2)
+                        bn.weight.data.uniform_(0.5, 2)
+                        bn.bias.data.uniform_(-1, 1)
+                m.eval()
+                example_inputs = (torch.randn(4, 8),)
+                ref_outputs = m(*example_inputs)
+                traced_model = torch.export.export(
+                    m, example_inputs, strict=True
+                ).module()
+                prepared_model = prepare_pt2e(traced_model, XNNPACKQuantizer())
+                prepared_outputs = prepared_model(*example_inputs)
+
+                torch.testing.assert_close(ref_outputs, prepared_outputs)
+                self.assertEqual(
+                    sum(
+                        node.target in batch_norm_targets
+                        for node in prepared_model.graph.nodes
+                    ),
+                    num_bn,
+                    str(prepared_model.graph),
+                )
 
     def test_linear_bn_fusion_skipped_for_3d_input(self):
         """Verify that Linear+BN fusion is skipped when input is >2-D.

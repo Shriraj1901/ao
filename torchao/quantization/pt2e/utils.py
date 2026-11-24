@@ -985,6 +985,10 @@ def _get_conv_bn_fusion_nodes(bn_node: Node) -> Optional[tuple[Node, Node]]:
     if not isinstance(bn_input, Node):
         return None
     if _is_aten_or_core_aten_bn_foldable_conv_node(bn_input):
+        # Folding the BN into the conv weights changes the conv output, so it is
+        # only valid when the BN is the sole consumer of that output.
+        if len(bn_input.users) != 1:
+            return None
         return bn_input, bn_input
 
     replacement_node = bn_input
@@ -1064,6 +1068,11 @@ def _fuse_linear_bn_(m: GraphModule) -> None:
         if not _is_linear_node(n):
             continue
         linear_node = n
+
+        # Folding the BN into the linear weights changes the linear output, so
+        # it is only valid when the BN is the sole consumer of that output.
+        if len(linear_node.users) != 1:
+            continue
 
         # Linear+BN fusion is only valid when both layers operate on
         # the same dimension.  Linear always acts on the last dim
